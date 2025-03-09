@@ -461,8 +461,6 @@ class Transactions(Sequence[Transaction]):
             start = match.end()
             end = valid_matches[i + 1].start() if i + 1 < len(valid_matches) else len(cleaned_data)
 
-            tag_data = cleaned_data[start:end].strip()
-
             # Identify which lines correspond to this tag
             raw_lines_for_tag = self.extract_raw_lines(start, end, lines)
 
@@ -531,23 +529,9 @@ class Transactions(Sequence[Transaction]):
         # Get the exact raw line from the original data
         raw_line = next((l for i, l in enumerate(lines) if i + 1 == line_number), "").strip()
 
-        # Parse the tag data
-        tag_dict: dict[str, Any] = tag.parse(self, tag_data)
-
-        # Define balance-related tags
-        balance_tags = {
-            "opening_balance",
-            "final_opening_balance",
-            "intermediate_opening_balance",
-            "closing_balance",
-            "final_closing_balance",
-            "intermediate_closing_balance",
-            "available_balance",
-            "forward_available_balance",
-        }
 
         # Inject raw line & line number **only for balances**
-        if tag.slug in balance_tags:
+        if "balance" in tag.slug:
             tag_dict["_raw_line"] = raw_line
             tag_dict["_line_number"] = line_number
 
