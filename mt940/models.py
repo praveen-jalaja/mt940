@@ -246,15 +246,20 @@ class Balance(Model):
         status: str | None = None,
         amount: Amount | str | None = None,
         date: Date | None = None,
+        _raw_line: str | None = None,  # 🔹 Add raw line storage
+        _line_number: int | None = None,  # 🔹 Add line number storage
         **kwargs: Any,
     ) -> None:
         if amount and not isinstance(amount, Amount):
             if status is None:  # pragma: no cover
-                raise ValueError('Cannot create Amount without status')
-            amount = Amount(amount, status, kwargs.get('currency'))
+                raise ValueError("Cannot create Amount without status")
+            amount = Amount(amount, status, kwargs.get("currency"))
+
         self.status = status
         self.amount = amount
         self.date = date
+        self._raw_line = _raw_line  # 🔹 Store raw line
+        self._line_number = _line_number  # 🔹 Store line number
 
     def __eq__(self, other: Any) -> bool:
         return (
@@ -264,10 +269,21 @@ class Balance(Model):
         )
 
     def __repr__(self) -> str:
-        return f'<{self}>'
+        return f"<{self}>"
 
     def __str__(self) -> str:
-        return f'{self.amount} @ {self.date}'
+        return f"{self.amount} @ {self.date}"
+
+    @property
+    def raw_line(self) -> str | None:
+        """🔹 Retrieve raw MT940 line"""
+        return self._raw_line
+
+    @property
+    def line_number(self) -> int | None:
+        """🔹 Retrieve line number from MT940 file"""
+        return self._line_number
+
 
 
 class Transaction(Model):
@@ -503,7 +519,46 @@ class Transactions(Sequence[Transaction]):
         for processor in self.processors.get(f'pre_{tag.slug}', []):
             tag_dict = processor(self, tag, tag_dict)
 
+        # result: Any = tag(self, tag_dict)
+        
+        # Convert full MT940 data into a list of lines
+        lines = data.split("\n")
+
+        # Identify the line number where this match starts
+        match_start = match.start()
+        line_number = sum(1 for l in data[:match_start] if l == "\n") + 1
+
+        # Get the exact raw line from the original data
+        raw_line = next((l for i, l in enumerate(lines) if i + 1 == line_number), "").strip()
+
+        # Parse the tag data
+        tag_dict: dict[str, Any] = tag.parse(self, tag_data)
+
+        # Define balance-related tags
+        balance_tags = {
+            "opening_balance",
+            "final_opening_balance",
+            "intermediate_opening_balance",
+            "closing_balance",
+            "final_closing_balance",
+            "intermediate_closing_balance",
+            "available_balance",
+            "forward_available_balance",
+        }
+
+        # Inject raw line & line number **only for balances**
+        if tag.slug in balance_tags:
+            tag_dict["_raw_line"] = raw_line
+            tag_dict["_line_number"] = line_number
+
+        # Create the Balance or Transaction object
         result: Any = tag(self, tag_dict)
+
+        # If it's a Balance object, store the raw line & line number
+        if isinstance(result, Balance):
+            result._raw_line = raw_line
+            result._line_number = line_number
+
 
         for processor in self.processors.get(f'post_{tag.slug}', []):
             result = processor(self, tag, tag_dict, result)
