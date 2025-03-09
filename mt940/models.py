@@ -275,9 +275,11 @@ class Transaction(Model):
         self,
         transactions: Transactions,
         data: dict[str, Any] | None = None,
+        raw_lines: list[tuple[int, str]] | None = None,  # Store (line_number, raw_text)
     ) -> None:
         self.transactions = transactions
         self.data: dict[str, Any] = {}
+        self.raw_lines = raw_lines or []  # Initialize empty list if not provided
         self.update(data)
 
     def update(
@@ -291,12 +293,17 @@ class Transaction(Model):
         """
         if data:
             self.data.update(data)
+            
+    def add_raw_line(self, line_number: int, line_text: str) -> None:
+        """Add raw MT940 line with line number."""
+        self.raw_lines.append((line_number, line_text))
 
     def __repr__(self) -> str:
-        return '<{}[{}] {}>'.format(
+        return '<{}[{}] {} RawLines:{}>'.format(
             self.__class__.__name__,
             self.data.get('date'),
             self.data.get('amount'),
+            len(self.raw_lines),
         )
 
 
@@ -415,49 +422,76 @@ class Transactions(Sequence[Transaction]):
         return mt940.tags.TAG_BY_ID
 
     def parse(self, data: str) -> list[Transaction]:
-        """Parses mt940 data, expects a string with data
+        """Parses MT940 data and tracks line numbers.
 
         Args:
-            data (str): The MT940 data
+            data (str): The MT940 data.
 
         Returns:
-            list[Transaction]: list of Transaction
+            list[Transaction]: Parsed transactions with raw lines.
         """
-        # Remove extraneous whitespace and such
-        data = '\n'.join(self.strip(data.split('\n')))
+        lines = data.split("\n")  # Keep original lines
+        cleaned_data = "\n".join(self.strip(lines))  # Clean extra spaces
 
-        # The pattern is a bit annoying to match by regex, even with a greedy
-        # match it's difficult to get both the beginning and the end so we're
-        # working around it in a safer way to get everything.
         tag_re = re.compile(
             r'^:\n?(?P<full_tag>(?P<tag>[0-9]{2}|NS)(?P<sub_tag>[A-Z])?):',
             re.MULTILINE,
         )
-        matches = list(tag_re.finditer(data))
+        matches = list(tag_re.finditer(cleaned_data))
 
-        # identify valid matches
         valid_matches = self.sanitize_tag_id_matches(matches)
 
         for i, match in enumerate(valid_matches):
-            self._process_match(match, i, valid_matches, data)
+            start = match.end()
+            end = valid_matches[i + 1].start() if i + 1 < len(valid_matches) else len(cleaned_data)
+
+            tag_data = cleaned_data[start:end].strip()
+
+            # Identify which lines correspond to this tag
+            raw_lines_for_tag = self.extract_raw_lines(start, end, lines)
+
+            # Process transaction with raw lines
+            self._process_match(match, i, valid_matches, cleaned_data, raw_lines_for_tag)
 
         return self.transactions
+    
+    def extract_raw_lines(self, start_idx: int, end_idx: int, lines: list[str]) -> list[tuple[int, str]]:
+        """Extracts raw lines with line numbers from the original MT940 data.
 
+        Args:
+            start_idx (int): Start index of the tag data.
+            end_idx (int): End index of the tag data.
+            lines (list[str]): Original MT940 lines.
+
+        Returns:
+            list[tuple[int, str]]: List of (line_number, raw_text).
+        """
+        raw_lines = []
+        char_count = 0  # Track character position
+
+        for line_number, line in enumerate(lines, start=1):
+            char_count += len(line) + 1  # Account for newline characters
+
+            if char_count > start_idx:
+                if char_count <= end_idx:
+                    raw_lines.append((line_number, line))
+                else:
+                    break
+
+        return raw_lines
+    
+    
     def _process_match(
-        self,
-        match: re.Match[str],
-        i: int,
-        valid_matches: list[re.Match[str]],
-        data: str,
-    ) -> None:
+    self,
+    match: re.Match[str],
+    i: int,
+    valid_matches: list[re.Match[str]],
+    data: str,
+    raw_lines: list[tuple[int, str]],  # NEW
+) -> None:
         tag_id = self.normalize_tag_id(match.group('tag'))
 
-        # get tag instance corresponding to tag id
         tag = self.tags.get(match.group('full_tag')) or self.tags[tag_id]
-
-        # Nice trick to get all the text that is part of this tag, python
-        # regex matches have a `end()` and `start()` to indicate the start
-        # and end index of the match.
 
         if valid_matches[i + 1 : i + 2]:
             tag_data = data[match.end() : valid_matches[i + 1].start()].strip()
@@ -466,40 +500,37 @@ class Transactions(Sequence[Transaction]):
 
         tag_dict: dict[str, Any] = tag.parse(self, tag_data)
 
-        # Preprocess data before creating the object
-
         for processor in self.processors.get(f'pre_{tag.slug}', []):
             tag_dict = processor(self, tag, tag_dict)
 
         result: Any = tag(self, tag_dict)
 
-        # Postprocess the object
-
         for processor in self.processors.get(f'post_{tag.slug}', []):
             result = processor(self, tag, tag_dict, result)
 
         if isinstance(tag, mt940.tags.Statement):
-            self._process_statement_tag(result)
+            self._process_statement_tag(result, raw_lines)  # Pass raw lines
         elif issubclass(tag.scope, Transaction) and self.transactions:
-            self._update_transaction(result)
-        elif issubclass(  # pragma: no branch
-            tag.scope, Transactions
-        ):  # pyright: ignore [reportUnnecessaryIsInstance]
+            self._update_transaction(result, raw_lines)  # Pass raw lines
+        elif issubclass(tag.scope, Transactions):  
             self.data.update(result)
 
-    def _process_statement_tag(self, result: dict[str, Any]) -> None:
-        if not self.transactions:
-            transaction = Transaction(self)
-            self.transactions.append(transaction)
 
-        transaction = self.transactions[-1]
-        if transaction.data.get('id'):
-            transaction = Transaction(self, result)
+    def _process_statement_tag(self, result: dict[str, Any], raw_lines: list[tuple[int, str]]) -> None:
+        """Process a statement tag and include raw lines."""
+        if not self.transactions:
+            transaction = Transaction(self, data=result, raw_lines=raw_lines)
             self.transactions.append(transaction)
         else:
-            transaction.data.update(result)
+            transaction = self.transactions[-1]
+            if transaction.data.get('id'):
+                transaction = Transaction(self, data=result, raw_lines=raw_lines)
+                self.transactions.append(transaction)
+            else:
+                transaction.data.update(result)
+                transaction.raw_lines.extend(raw_lines)  # Append raw lines
 
-    def _update_transaction(self, result: dict[str, Any]) -> None:
+    def _update_transaction(self, result: dict[str, Any], raw_lines: list[tuple[int, str]]) -> None:
         transaction = self.transactions[-1]
         for k, v in result.items():
             if k in transaction.data and hasattr(v, 'strip'):
@@ -507,6 +538,8 @@ class Transactions(Sequence[Transaction]):
             else:
                 transaction.data[k] = v
 
+        transaction.raw_lines.extend(raw_lines)  # Append raw lines
+        
     @overload
     def __getitem__(self, key: int) -> Transaction: ...
 
